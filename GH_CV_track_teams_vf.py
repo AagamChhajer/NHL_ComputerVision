@@ -16,6 +16,11 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 from PIL import Image
 from implement import TPS_ResNet_BiLSTM_Attn, Options
+from modules.transformation import TPS_SpatialTransformerNetwork
+from modules.feature_extraction import VGG_FeatureExtractor, RCNN_FeatureExtractor, ResNet_FeatureExtractor
+from modules.sequence_modeling import BidirectionalLSTM
+from modules.prediction import Attention
+from modules.tesseract_recog import JerseyNumberExtractor
 
 # MODEL INPUTS
 model_path = '../last.pt'
@@ -531,117 +536,129 @@ class HockeyAnalyzer:
 
     # Supporting method for player names
     def analyze_video(self, video_path, output_path, tracks_path, metadata_output_path, pth_model):
-            with open(tracks_path, 'rb') as f:
-                tracks = pickle.load(f)
+        with open(tracks_path, 'rb') as f:
+            tracks = pickle.load(f)
 
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                print("Error: Could not open video.")
-                return
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print("Error: Could not open video.")
+            return
 
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-            # Codec and VideoWriter object
-            fourcc = cv2.VideoWriter_fourcc(*'XVID')
-            out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
+        # Codec and VideoWriter object
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
-            synthetic_metadata = {}  # To store metadata for all frames
-            frame_num = 0
+        synthetic_metadata = {}  # To store metadata for all frames
+        frame_num = 0
+        jersey_numbers = {}  # Store jersey numbers for each track_id
+        while cap.isOpened():
+            
+            ret, frame = cap.read()
+            if not ret:
+                break
+            print(frame_num)
 
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
+            mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+            cv2.fillConvexPoly(mask, self.rink_coordinates, 1)
+            mask = mask.astype(bool)
 
-                mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-                cv2.fillConvexPoly(mask, self.rink_coordinates, 1)
-                mask = mask.astype(bool)
+            # Draw rink area
+            cv2.polylines(frame, [self.rink_coordinates], isClosed=True, color=(0, 255, 0), thickness=2)
 
-                # Draw rink area
-                cv2.polylines(frame, [self.rink_coordinates], isClosed=True, color=(0, 255, 0), thickness=2)
+            # Get tracks for the current frame
+            player_dict = tracks["person"][frame_num]
+            frame_metadata = {}
 
-                # Get tracks for the current frame
-                player_dict = tracks["person"][frame_num]
-                frame_metadata = {}
+            for track_id, player in player_dict.items():
+                bbox = player["bbox"]
 
-                for track_id, player in player_dict.items():
-                    bbox = player["bbox"]
+                # Check if players are within the ice rink
+                x_center = int((bbox[0] + bbox[2]) / 2)
+                y_center = int((bbox[1] + bbox[3]) / 2)
+                if not mask[y_center, x_center]:
+                    continue
 
-                    # Check if players are within the ice rink
-                    x_center = int((bbox[0] + bbox[2]) / 2)
-                    y_center = int((bbox[1] + bbox[3]) / 2)
-                    if not mask[y_center, x_center]:
-                        continue
-                    #change 1
-                    jersey_number = self.get_jersey_number(frame, bbox, pth_model)
+                # Initialize JerseyNumberExtractor only once
+                extractor = JerseyNumberExtractor()
 
-                    # Predict the team
-                    x1, y1, x2, y2 = map(int, bbox)
-                    cropped_image = frame[y1:y2, x1:x2]
-                    cropped_pil_image = Image.fromarray(cv2.cvtColor(cropped_image, cv2.COLOR_BGR2RGB))
-                    transformed_image = self.transform(cropped_pil_image).unsqueeze(0)
-                    team = self.predict_team(transformed_image)
+                # Extract the jersey number (if it hasn't been detected yet for this track_id)
+                if track_id not in jersey_numbers:
+                    try:
+                        detected_number = extractor.get_jersey_number(frame, bbox, pth_model)
+                        if detected_number:  # Store only if a number was detected
+                            jersey_numbers[track_id] = detected_number
+                    except ValueError as e:
+                        print(f"Error processing track_id {track_id}: {e}")
+                        detected_number = None
+                else:
+                    detected_number = jersey_numbers[track_id]
 
-                    # Get player name Change 2
-                    # player_name = self.get_player_name(track_id)
+                # Predict the team
+                x1, y1, x2, y2 = map(int, bbox)
+                cropped_image = frame[y1:y2, x1:x2]
+                cropped_pil_image = Image.fromarray(cv2.cvtColor(cropped_image, cv2.COLOR_BGR2RGB))
+                transformed_image = self.transform(cropped_pil_image).unsqueeze(0)
+                team = self.predict_team(transformed_image)
 
-                    # Draw bounding ellipse and labels
-                    self.draw_ellipse(frame, bbox, (0, 255, 0), track_id, team)
-                    text_color = (255, 255, 255) if team == 'Referee' else (255, 215, 0) if team == 'Tm_white' else (0, 255, 255)
+                # Draw bounding ellipse and labels
+                self.draw_ellipse(frame, bbox, (0, 255, 0), track_id, team)
+                text_color = (255, 255, 255) if team == 'Referee' else (255, 215, 0) if team == 'Tm_white' else (0, 255, 255)
 
-                    # Draw team label
-                    cv2.putText(frame, f"#{jersey_number}", (x1, y1 - 20), cv2.FONT_HERSHEY_PLAIN, 1, text_color, thickness=2)
-                    cv2.putText(frame, team, (x1, y1 - 40), cv2.FONT_HERSHEY_PLAIN, 1, text_color, thickness=2)
+                # Draw team label and jersey number
+                if detected_number:
+                    cv2.putText(frame, f"#{detected_number}", (x1, y1 - 20), cv2.FONT_HERSHEY_PLAIN, 1, text_color, thickness=2)
+                cv2.putText(frame, team, (x1, y1 - 40), cv2.FONT_HERSHEY_PLAIN, 1, text_color, thickness=2)
 
-                    # Calculate speed
-                    speed = self.calculate_speed(track_id, x_center, y_center, fps)
+                # Calculate speed
+                speed = self.calculate_speed(track_id, x_center, y_center, fps)
 
-                    # Add speed label
-                    cv2.putText(
-                        frame,
-                        f"Speed: {speed:.2f} m/s",
-                        (x1, y1 + 20),
-                        cv2.FONT_HERSHEY_PLAIN,
-                        0.8,
-                        text_color,
-                        thickness=2
-                    )
+                # Add speed label
+                cv2.putText(
+                    frame,
+                    f"Speed: {speed:.2f} m/s",
+                    (x1, y1 + 20),
+                    cv2.FONT_HERSHEY_PLAIN,
+                    0.8,
+                    text_color,
+                    thickness=2
+                )
 
-                    # Update team stats
-                    distance = speed / fps
-                    position = (x_center, y_center)
-                    self.update_team_stats(team, speed, distance, position)
+                # Update team stats
+                distance = speed / fps
+                position = (x_center, y_center)
+                self.update_team_stats(team, speed, distance, position)
 
-                    # Save metadata
-                    frame_metadata[track_id] = {
-                        "jersey_number": jersey_number,
-                        "team": team,
-                        "bbox": bbox,
-                        "speed": round(speed, 2),
-                        "distance": round(distance, 2)
-                    }
+                # Save metadata
+                frame_metadata[track_id] = {
+                    "jersey_number": detected_number,
+                    "team": team,
+                    "bbox": bbox,
+                    "speed": round(speed, 2),
+                    "distance": round(distance, 2)
+                }
 
-                # Draw the dashboard
-                self.draw_semi_transparent_rectangle(frame)
+            # Draw the dashboard
+            self.draw_semi_transparent_rectangle(frame)
 
-                # Save metadata for the current frame
-                synthetic_metadata[frame_num] = frame_metadata
+            # Save metadata for the current frame
+            synthetic_metadata[frame_num] = frame_metadata
 
-                # Write processed frame to the output video
-                out.write(frame)
-                frame_num += 1
+            # Write processed frame to the output video
+            out.write(frame)
+            frame_num += 1
 
-            # Save synthetic metadata to a JSON file
+        # Save synthetic metadata to a JSON file
+        with open(metadata_output_path, 'w') as meta_file:
+            json.dump(synthetic_metadata, meta_file, indent=4)
 
-            with open(metadata_output_path, 'w') as meta_file:
-                json.dump(synthetic_metadata, meta_file, indent=4)
-
-            cap.release()
-            out.release()
-            print("Video analysis complete. Output saved to:", output_path)
-            print("Metadata saved to:", metadata_output_path)
+        cap.release()
+        out.release()
+        print("Video analysis complete. Output saved to:", output_path)
+        print("Metadata saved to:", metadata_output_path)
     def get_player_name(self, track_id):
         """
         Returns the player's name for a given track ID.
@@ -655,6 +672,17 @@ class HockeyAnalyzer:
             # Add more mappings as needed
         }
         return player_names.get(track_id, "Unknown Player")
+    def prepare_image(self, frame, bbox):
+    # Crop and resize the region of interest
+        roi = frame[bbox[1]:bbox[3], bbox[0]:bbox[2]]
+        resized_image = cv2.resize(roi, (150, 150))
+
+        # Convert to grayscale if required
+        gray_image = cv2.cvtColor(resized_image, cv2.COLOR_BGR2GRAY)
+
+        # Normalize and convert to tensor
+        tensor_image = torch.tensor(gray_image, dtype=torch.float32).unsqueeze(0).unsqueeze(0) / 255.0
+        return tensor_image
     def get_jersey_number(self, frame, bbox, pth_model):
     # """
     # Extracts and recognizes the jersey number from a given bounding box in the frame.
@@ -673,7 +701,20 @@ class HockeyAnalyzer:
 
         # Convert the image to PIL format and transform it for the model
         cropped_pil_image = Image.fromarray(cv2.cvtColor(cropped_image, cv2.COLOR_BGR2RGB))
-        transformed_image = self.transform(cropped_pil_image).unsqueeze(0)
+        transformed_image = self.prepare_image(frame, bbox)
+    
+    # Convert RGB to Grayscale
+        grayscale_transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Grayscale(num_output_channels=1),
+            transforms.ToTensor()
+        ])
+        transformed_image = grayscale_transform(transformed_image)
+
+        # Ensure input has correct dimensions
+        transformed_image = transformed_image.unsqueeze(0)  # Add batch dimension
+
+
         opt = Options()
 # Instantiate the model
         pth_model = TPS_ResNet_BiLSTM_Attn(opt)
@@ -684,14 +725,17 @@ class HockeyAnalyzer:
 
         # Switch to evaluation mode
         pth_model.eval()
-        # Predict jersey number using the pth model
-        # pth_model = torch.load("./hello.pth")
-        # pth_model.eval()
-        with torch.no_grad():
-            prediction = pth_model(transformed_image)
-            jersey_number = prediction.argmax(dim=1).item()
+        # with torch.no_grad():
+        #     prediction = pth_model(transformed_image, dummy_text, is_train=False)
+        #     jersey_number = prediction.argmax(dim=1).item()
 
-        return str(jersey_number)
+        # return str(jersey_number)
+        with torch.no_grad():
+            visual_feature = pth_model.FeatureExtraction(transformed_image)
+            contextual_feature = visual_feature.squeeze(3)  # Adjust shape as needed
+            jersey_number = torch.argmax(contextual_feature, dim=1)  # Simple classification
+
+        return jersey_number
 
 
 class CNNModel(nn.Module):

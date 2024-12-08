@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 from modules.transformation import TPS_SpatialTransformerNetwork
-from modules.feature_extraction import ResNet_FeatureExtractor
+from modules.feature_extraction import VGG_FeatureExtractor, RCNN_FeatureExtractor, ResNet_FeatureExtractor
 from modules.sequence_modeling import BidirectionalLSTM
 from modules.prediction import Attention
 
@@ -72,7 +72,7 @@ class Options:
         self.num_fiducial = 20
         self.imgH = 32
         self.imgW = 100
-        self.input_channel = 1
+        self.input_channel = 3
         self.output_channel = 512
         self.hidden_size = 256
         self.num_class = 37  # Adjust based on the dataset (e.g., number of alphanumeric characters)
@@ -84,7 +84,7 @@ model = TPS_ResNet_BiLSTM_Attn(opt)
 
 # Load the state dictionary
 state_dict = torch.load("./hello.pth")
-model.load_state_dict(state_dict)
+model.load_state_dict(state_dict,strict=False)
 
 # Switch to evaluation mode
 model.eval()
